@@ -1,0 +1,133 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 7a9a096..ffc4ad1 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -1802,6 +1802,19 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
+     if source_msg.get("role") != "assistant":
+         return
+ 
++    # DeepSeek thinking mode requires reasoning_content echo-back, but the
++    # field is provider-facing thinking state. When thinking is explicitly
++    # disabled (for example, reasoning_effort: none), do not replay old
++    # thinking-mode state into the non-thinking request path.
++    thinking_disabled = getattr(agent, "_thinking_mode_disabled", None)
++    if (
++        callable(thinking_disabled)
++        and thinking_disabled()
++        and agent._needs_deepseek_tool_reasoning()
++    ):
++        api_msg.pop("reasoning_content", None)
++        return
++
+     # 1. Explicit reasoning_content already set — preserve it verbatim
+     # (includes DeepSeek/Kimi's own space-placeholder written at creation
+     # time, and any valid reasoning content from the same provider).
+diff --git a/run_agent.py b/run_agent.py
+index f842ce6..3814c90 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -3601,6 +3601,11 @@ class AIAgent:
+         from agent.chat_completion_helpers import build_assistant_message
+         return build_assistant_message(self, assistant_message, finish_reason)
+ 
++    def _thinking_mode_disabled(self) -> bool:
++        """Return True when the active request config explicitly disables thinking."""
++        cfg = getattr(self, "reasoning_config", None)
++        return bool(isinstance(cfg, dict) and cfg.get("enabled") is False)
++
+     def _needs_thinking_reasoning_pad(self) -> bool:
+         """Return True when the active provider enforces reasoning_content echo-back.
+ 
+@@ -3616,6 +3621,8 @@ class AIAgent:
+         ``urlparse``) calls under it. Caching drops the per-turn cost from
+         ~5us × 16 = ~80us to <1us.
+         """
++        if self._thinking_mode_disabled():
++            return False
+         key = (self.provider, self.model, getattr(self, "_base_url_lower", self.base_url))
+         cached = getattr(self, "_thinking_pad_cache", None)
+         if cached is not None and cached[0] == key:
+diff --git a/tests/run_agent/test_deepseek_reasoning_content_echo.py b/tests/run_agent/test_deepseek_reasoning_content_echo.py
+index 0efdb2c..806c2e3 100644
+--- a/tests/run_agent/test_deepseek_reasoning_content_echo.py
++++ b/tests/run_agent/test_deepseek_reasoning_content_echo.py
+@@ -36,11 +36,17 @@ import pytest
+ from run_agent import AIAgent
+ 
+ 
+-def _make_agent(provider: str = "", model: str = "", base_url: str = "") -> AIAgent:
++def _make_agent(
++    provider: str = "",
++    model: str = "",
++    base_url: str = "",
++    reasoning_config: dict | None = None,
++) -> AIAgent:
+     agent = object.__new__(AIAgent)
+     agent.provider = provider
+     agent.model = model
+     agent.base_url = base_url
++    agent.reasoning_config = reasoning_config
+     agent.verbose_logging = False
+     agent.reasoning_callback = None
+     agent.stream_delta_callback = None
+@@ -123,6 +129,24 @@ class TestCopyReasoningContentForApi:
+         agent._copy_reasoning_content_for_api(source, api_msg)
+         assert api_msg.get("reasoning_content") == " "
+ 
++    def test_deepseek_thinking_disabled_does_not_replay_reasoning_content(self) -> None:
++        """Non-thinking DeepSeek requests must not replay old thinking-mode state."""
++        agent = _make_agent(
++            provider="deepseek",
++            model="deepseek-v4-pro",
++            reasoning_config={"enabled": False},
++        )
++        source = {
++            "role": "assistant",
++            "content": "",
++            "reasoning": "old reasoning",
++            "reasoning_content": "old provider scratchpad",
++            "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}],
++        }
++        api_msg: dict = {}
++        agent._copy_reasoning_content_for_api(source, api_msg)
++        assert "reasoning_content" not in api_msg
++
+     def test_deepseek_assistant_no_tool_call_gets_padded(self) -> None:
+         """DeepSeek thinking mode pads ALL assistant turns, even without tool_calls."""
+         agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
+@@ -369,6 +393,35 @@ class TestBuildAssistantMessageDeepSeekReasoningContent:
+         assert msg["reasoning_content"] == " "
+         assert msg["tool_calls"][0]["id"] == "call_1"
+ 
++    def test_deepseek_thinking_disabled_tool_call_does_not_get_placeholder(self) -> None:
++        agent = _make_agent(
++            provider="deepseek",
++            model="deepseek-v4-pro",
++            reasoning_config={"enabled": False},
++        )
++        assistant_message = SimpleNamespace(
++            content=None,
++            reasoning=None,
++            reasoning_content=None,
++            reasoning_details=None,
++            codex_reasoning_items=None,
++            codex_message_items=None,
++            tool_calls=[
++                SimpleNamespace(
++                    id="call_1",
++                    call_id=None,
++                    response_item_id=None,
++                    type="function",
++                    function=SimpleNamespace(name="terminal", arguments="{}"),
++                )
++            ],
++        )
++
++        msg = agent._build_assistant_message(assistant_message, "tool_calls")
++
++        assert "reasoning_content" not in msg
++        assert msg["tool_calls"][0]["id"] == "call_1"
++
+ 
+ class TestBuildAssistantMessagePadsStrictProviders:
+     """Regression for #17400: _build_assistant_message must pin reasoning_content
